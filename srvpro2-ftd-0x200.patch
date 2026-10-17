@@ -1,0 +1,24 @@
+diff --git a/src/utility/calculate-duel-options.ts b/src/utility/calculate-duel-options.ts
+index a704f58..a6f09b9 100644
+--- a/src/utility/calculate-duel-options.ts
++++ b/src/utility/calculate-duel-options.ts
+@@ -7,10 +7,19 @@ import { OcgcoreDuelOptionFlag } from 'koishipro-core.js';
+  * @param isTag Whether this is a tag duel
+  * @returns Duel options number
+  */
++// Custom ocgcore flag (DUEL_FIRST_TURN_DRAW = 0x200).
++// Not part of upstream OcgcoreDuelOptionFlag: it only takes effect on a patched
++// ocgcore wasm that understands bit 0x200. Enable with env FIRST_TURN_DRAW=1.
++const DUEL_FIRST_TURN_DRAW = 0x200;
++
+ export function calculateDuelOptions(hostinfo: HostInfo): number {
+   // duel_rule is stored in high 16 bits
+   let opt = hostinfo.duel_rule << 16;
+ 
++  if (process.env.FIRST_TURN_DRAW === '1') {
++    opt |= DUEL_FIRST_TURN_DRAW;
++  }
++
+   if (hostinfo.no_shuffle_deck) {
+     opt |= OcgcoreDuelOptionFlag.PseudoShuffle;
+   }

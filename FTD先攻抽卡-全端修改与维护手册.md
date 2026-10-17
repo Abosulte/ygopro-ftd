@@ -1,0 +1,1338 @@
+# 游戏王「先攻抽卡(FTD)」补丁 — 全端修改与维护手册
+
+> 本手册覆盖：**srvpro2 服务器**、**srvpro 服务器**、**本地客户端（MDPro3 / ygopro / ygopro2）** 的 FTD（First Turn Draw，先攻抽卡）修改方法，以及**上游更新后的维护方法**。
+
+---
+
+## 〇、交接说明（给接手者的需求与要点）
+
+### 需求（一句话）
+
+让游戏王对战各端（服务端 + 客户端）支持「**先攻第一回合也抽卡**」——即在标准 OCG 规则（先攻起手 5 张）基础上，通过一个开关（`0x200` 选项位），让先攻玩家第一回合也能抽牌（起手 6 张）。
+
+### 完成这项修改，需要改动的四个端
+
+| 端                             | 改什么                                     | 产物                |
+| ----------------------------- | --------------------------------------- | ----------------- |
+| srvpro2 服务器                   | ocgcore wasm 打补丁 + TS 加开关               | `libocgcore.wasm` |
+| srvpro 服务器                    | ocgcore C++ 打补丁 + 主程序加开关                | `ygopro` 二进制      |
+| MDPro3 / ygopro / ygopro2 客户端 | ocgcore 打补丁（录像是为了重放不报错）                 | dll / exe         |
+| 安卓版（YGOMobile / MDPro3 安卓）    | ocgcore 打补丁（同 PC 版三处）+ NDK 编译 + apk 重签名 | `.so`（未实测）        |
+
+### 接手者必须注意的三个关键点（踩坑点）
+
+1. **服务端和客户端的 ocgcore 必须打同一份补丁**，否则录像重放对不上（客户端报错/数据错乱）。
+2. **srvpro2 的 wasm 必须用 emscripten 3.1.6 编译**（Debian bookworm 仓库版），用其他版本会 ABI 不匹配、对局初始化崩溃。这是最容易踩的坑。
+3. **补丁是"开关式"**：打了补丁只是"支持"0x200 这个位，真正生效还要在创建对局时把 0x200 传进去（各端通过环境变量控制）。
+
+### 各端开启 FTD 的环境变量对照（务必区分，两个服务端不同！）
+
+| 端                          | 环境变量                     | 开启值                 |
+| -------------------------- | ------------------------ | ------------------- |
+| **srvpro2**                | `FIRST_TURN_DRAW`        | `=1`                |
+| **srvpro**                 | `YGO_FIRST_TURN_DRAW`    | `=1`（多了 `YGO_` 前缀！） |
+| 客户端（MDPro3/ygopro/ygopro2） | 无需环境变量（录像 opt 里自带 0x200） | —                   |
+
+> ⚠️ **极易混淆点**：srvpro2 是 `FIRST_TURN_DRAW=1`，srvpro 是 `YGO_FIRST_TURN_DRAW=1`。两者变量名不同，千万别用错。
+
+### 本手册的自足性说明
+
+- **附录 A/B/C/D 已包含全部补丁内容**（可直接复制使用），不依赖外部文件。
+- 正文第三节（srvpro2）的 Dockerfile 和第四节（srvpro）的补丁步骤可直接照做。
+- 客户端如需零基础逐步教程，可参考配套文档《客户端ocgcore-FTD补丁-零基础网页操作教程.md》和《ygopro经典客户端-FTD补丁方案.md》（若一并提供）。
+
+---
+
+## 一、原理：FTD 是什么，为什么需要改这么多端
+
+### 1.1 什么是 FTD
+
+标准 OCG 新大师规则（`duel_rule >= 3`）下，**先攻玩家第一回合不抽卡**（起手 5 张）。FTD（先攻抽卡）就是让先攻第一回合**也抽卡**（起手 6 张）。
+
+### 1.2 实现原理：一个"开关位" 0x200
+
+在 ocgcore 引擎里，决斗选项是一个整数，其中 `0x200` 这个位被用作 FTD 开关：
+
+- 决斗时 `options` 里**带上 `0x200`** → 先攻抽卡
+- 不带 → 保持标准规则（先攻不抽卡）
+
+### 1.3 为什么每个端都要改
+
+因为一个完整对局涉及多个端，每个端都有一份 ocgcore 引擎，且**必须理解 0x200 这个位**，否则行为不一致：
+
+| 端                     | 作用      | 不改的后果                              |
+| --------------------- | ------- | ---------------------------------- |
+| 服务端（srvpro / srvpro2） | 创建对局、算牌 | 先攻不抽卡（FTD 不生效）                     |
+| 客户端（播放录像）             | 重放录像    | 录像里 opt=0x200，客户端不认识 → **报错/数据错乱** |
+
+**核心规则**：**服务端和客户端的 ocgcore 必须用同一份 FTD 补丁**，否则对不上。
+
+---
+
+## 二、补丁核心（三处 C++ 改动，所有端通用）
+
+FTD 补丁本质是改 ocgcore 源码的 3 个地方。**这些改动在所有端完全一样**，只是"怎么编译"和"怎么设置 0x200"不同。
+
+### 改动 1：`common.h` — 新增选项位
+
+在 `#define DUEL_REVEAL_DECK_SEQ	0x100` 下面加：
+
+```c
+#define DUEL_FIRST_TURN_DRAW	0x200
+```
+
+### 改动 2：`field.cpp` — `get_draw_count` 加判断
+
+```c
+// 改前
+if ((core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
+// 改后
+if (!(core.duel_options & DUEL_FIRST_TURN_DRAW) && (core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
+```
+
+### 改动 3：`processor.cpp` — `process_turn` 抽卡逻辑
+
+```c
+// 改前
+if((core.duel_rule <= 2) || (infos.turn_id > 1)) {
+// 改后
+if((core.duel_options & DUEL_FIRST_TURN_DRAW) || (core.duel_rule <= 2) || (infos.turn_id > 1)) {
+```
+
+> 完整 patch 文件见附录 A。`0x200` 是空位（现有选项位最高到 `0x100`），无冲突。
+
+---
+
+## 三、srvpro2 服务器修改
+
+### 3.1 特点
+
+srvpro2 的 ocgcore 是 **wasm 文件**（`node_modules/koishipro-core.js/dist/vendor/wasm_cjs/libocgcore.wasm`），配合一个 `.cjs` 胶水文件。改动最小：换 1 个 wasm + 改 1 行 TS。
+
+### 3.2 步骤
+
+**第 1 步：编译带 FTD 的 wasm（关键：必须用 emscripten 3.1.6）**
+
+用 Docker 编译，锁定 emscripten 版本（Debian bookworm 仓库的 3.1.6，这是 srvpro2 内置 wasm 的版本，用其他版本会不兼容崩溃）：
+
+```bash
+cd /root/ocgcore-ftd
+cat > Dockerfile.ftd <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential emscripten uuid-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY premake5 /usr/local/bin/premake5
+RUN chmod +x /usr/local/bin/premake5
+COPY . /usr/src/ocgcore
+WORKDIR /usr/src/ocgcore
+RUN set -eux; \
+    ln -sf premake/dll.lua . && \
+    cp premake/lua.lua lua/premake5.lua && \
+    premake5 gmake --file=dll.lua --os=emscripten && \
+    make -C build config=release_wasm_cjs -j$(nproc) && \
+    cp build/bin/wasm_cjs/Release/libocgcore.wasm /libocgcore-ftd.wasm && \
+    cp build/bin/wasm_cjs/Release/libocgcore.cjs /libocgcore-ftd.cjs
+EOF
+docker build -f Dockerfile.ftd -t ocgcore-ftd .
+```
+
+> 说明：ocgcore 源码（`/root/ocgcore-ftd`）需先打好三处补丁；`premake5` 是宿主机编译好的二进制（因官方预编译版有 glibc 版本问题，需从源码编译）。
+
+**第 2 步：提取产物**
+
+```bash
+docker create --name tmp ocgcore-ftd
+docker cp tmp:/libocgcore-ftd.wasm /root/srvpro2/libocgcore-ftd.wasm
+docker cp tmp:/libocgcore-ftd.cjs  /root/srvpro2/libocgcore-ftd.cjs
+docker rm tmp
+```
+
+**第 3 步：改 `src/utility/calculate-duel-options.ts`**（加 0x200 开关）
+
+> 这个改动对应补丁文件 **`srvpro2-ftd-0x200.patch`**，可直接 `git apply srvpro2-ftd-0x200.patch`，或手动改如下：
+
+```ts
+const DUEL_FIRST_TURN_DRAW = 0x200;
+export function calculateDuelOptions(hostinfo: HostInfo): number {
+  let opt = hostinfo.duel_rule << 16;
+  if (process.env.FIRST_TURN_DRAW === '1') {   // ← 新增，环境变量 FIRST_TURN_DRAW
+    opt |= DUEL_FIRST_TURN_DRAW;
+  }
+  // ... 其余不变
+}
+```
+
+然后 `npm run build` 重新编译 TS。
+
+**第 4 步：部署（成对替换 cjs+wasm）**
+
+```bash
+cd /root/srvpro2/node_modules/koishipro-core.js/dist/vendor/wasm_cjs/
+cp libocgcore.wasm libocgcore.wasm.bak
+cp /root/srvpro2/libocgcore-ftd.cjs libocgcore.cjs
+cp /root/srvpro2/libocgcore-ftd.wasm libocgcore.wasm
+```
+
+**第 5 步：开启并重启**
+
+```bash
+FIRST_TURN_DRAW=1 pm2 restart srvpro2 --update-env
+```
+
+---
+
+## 四、srvpro 服务器修改
+
+### 4.1 特点
+
+srvpro 的 ocgcore 是**静态链接进单个 `ygopro` 二进制**（不是 wasm），源码在 `mycard/ygopro` 仓库的 `ocgcore` submodule。改动较大：需要改 C++ 源码 + 重新编译整个二进制。
+
+### 4.2 步骤
+
+**第 1 步：拿到源码并打两个补丁**
+
+```bash
+git clone --recursive https://code.moenext.com/mycard/ygopro.git
+cd ygopro
+# 补丁 1：ocgcore 三处 C++ 改动（附录 B）
+git apply srvpro-ocgcore-ftd-0x200.patch
+# 补丁 2：gframe/single_duel.cpp 加环境变量开关（附录 C）
+git apply srvpro-ygopro-ftd-0x200.patch
+```
+
+补丁 2 的作用：在 `gframe/single_duel.cpp` 的 `opt` 计算处，通过环境变量 `YGO_FIRST_TURN_DRAW=1` 开启 FTD：
+
+```cpp
+unsigned int opt = (unsigned int)host_info.duel_rule << 16;
+if(host_info.no_shuffle_deck)
+    opt |= DUEL_PSEUDO_SHUFFLE;
+// 新增：环境变量控制 FTD
+if(const char* ftd = std::getenv("YGO_FIRST_TURN_DRAW"))
+    if(ftd[0] == '1')
+        opt |= DUEL_FIRST_TURN_DRAW;
+```
+
+**第 2 步：重新编译（Dockerfile.lite）**
+
+```bash
+docker build -f Dockerfile.lite -t srvpro .
+```
+
+编译产物是 `bin/release/ygopro` 单文件（ocgcore 已静态链接进去）。
+
+**第 3 步：部署**
+
+替换服务器上的 `ygopro` 二进制，然后以 `YGO_FIRST_TURN_DRAW=1` 启动。
+
+> ⚠️ **注意**：srvpro2 和 srvpro 共用资源目录（srvpro2 的 `./ygopro` 软链到 srvpro 的 `/root/ygopro/`），改 srvpro 时要小心共享目录风险。srvpro2 改 wasm 绝不碰 srvpro，反之亦然。
+
+---
+
+## 五、本地客户端修改
+
+### 5.1 前提：为什么客户端也要改
+
+客户端播放**本地录像（.yrp）**&#x65F6;，用本地 ocgcore 重放。录像头里 opt=0x200（服务端开的），客户端 ocgcore 若不认识 0x200 就会状态错乱。所以客户端也要打补丁。
+
+### 5.2 MDPro3
+
+MDPro3 的 ocgcore 是独立 `ocgcore.dll`（`MDPro3_Data\Plugins\x86_64\ocgcore.dll`）。
+
+**方法**：fork `Fluorohydride/ygopro-core` → 用 GitHub Actions 自动打补丁编译 → 替换 dll。
+
+- fork `https://github.com/Fluorohydride/ygopro-core`
+- 编辑 `.github/workflows/build.yml`，在 `Checkout` 之后加一段 Python 打补丁脚本（三处字符串替换，见附录 D）
+- Actions 编译出 `ocgcore.dll`（x64 版）
+- 替换 `MDPro3_Data\Plugins\x86_64\ocgcore.dll`（先备份）
+
+> 已确认：MDPro3 的 dll 里虽有 14 个私有扩展符号，但 MDPro3 代码实际不调用它们，用官方源码编译缺扩展不影响。
+
+### 5.3 ygopro（经典 C++ 客户端）
+
+ygopro 的 ocgcore 是**静态链接进 `YGOPro.exe`** 的，要编译整个客户端。
+
+**方法**：fork `Fluorohydride/ygopro` → 在官方 CI 的 `Fetch ocgcore` 之后插入打补丁脚本 → 编译出 `YGOPro.exe`。
+
+- fork `https://github.com/Fluorohydride/ygopro`
+- 编辑 `.github/workflows/build.yml`，在 prepare job 的 `Fetch ocgcore` 之后插入打补丁 step（完整改好的文件见工作目录 `ygopro-build.yml`）
+- Actions 编译出 `YGOPro.exe`（选 `windows-x64-no-simd`）
+- 替换原 exe（先备份）
+
+### 5.4 ygopro2
+
+**最简单**：ygopro2 的 ocgcore.dll（导出 21 个函数）**全部被 MDPro3 的 ocgcore.dll（导出 35 个函数）覆盖**，函数名完全一致。**直接把 MDPro3 那个（已打 FTD 补丁的）ocgcore.dll 复制过去替换即可**，无需重新编译。
+
+- 备份 `Assets/Plugins/x64/ocgcore.dll`（和 `x86/ocgcore.dll`）
+- 用 MDPro3 的 ocgcore.dll 覆盖
+- 已实测可行 ✅
+
+### 5.5 安卓版（YGOMobile / MDPro3 安卓）— 方案同 PC 版，未实测
+
+安卓版的 ocgcore 是 `.so` 文件，FTD 补丁**三处 C++ 改动和 PC 版完全一样**（都是新版 ocgcore，见附录 A）。区别只在「编译成 .so」和「替换进 apk」。
+
+| 安卓版              | ocgcore 源码位置                         | 产物                                | 编译方式                                                    |
+| ---------------- | ------------------------------------ | --------------------------------- | ------------------------------------------------------- |
+| YGOMobile（原生安卓）  | `Classes/ocgcore/`                   | `libYGOMobile.so`（ocgcore 静态链接进去） | NDK R29，`./gradlew :libcore:buildYgoCore` 或 `ndk-build` |
+| MDPro3 安卓（Unity） | `Tools/YGO Classes/ocgcore/`（同 PC 版） | `libocgcore.so`（独立）               | NDK（Android.mk，`LOCAL_MODULE_FILENAME := libocgcore`）   |
+
+**通用流程**：
+
+1. 拿到 ocgcore 源码（YGOMobile：`https://github.com/fallenstardust/YGOMobile-cn-ko-en`；MDPro3：`https://code.moenext.com/sherry_chaos/MDPro3`），打三处补丁（同附录 A）
+2. 用 NDK 编译成 `.so`（可在 GitHub Actions 的 ubuntu runner + 装 NDK 上完成）
+3. 解包 apk → 替换 `lib/<abi>/*.so` → **重新签名**（jarsigner/apksigner + keystore）
+
+**安卓版特有的两个复杂度**：
+
+- 需要 **Android NDK** 编译环境（YGOMobile 用 NDK R29）
+- 重签名的 apk **无法覆盖安装官方版**（签名变了，要么卸载重装，要么改包名共存）
+
+> ⚠️ **本节尚未实际测试**：补丁位置已通过源码核验确认，但「NDK 编译 + apk 重打包」的完整流程待验证。后续需要时再实测。
+
+---
+
+## 六、上游更新后的维护方法
+
+这是关键——上游项目更新后，补丁可能失效或版本不匹配。下面按"上游类型"分别说明。
+
+### 6.1 核心原则
+
+FTD 补丁改的是 ocgcore 的**3 个固定逻辑点**（`get_draw_count` 的先攻判断 + `process_turn` 的抽卡判断 + 选项位定义）。这些逻辑点**长期稳定**，即使上游更新，也只是**行号变了**，逻辑本身大概率还在。
+
+### 6.2 ocgcore 上游更新后（影响所有端）
+
+当 `ygopro-core`（或 wasm）更新后：
+
+1. **重新定位三处补丁**：用 grep 找关键词
+   ```bash
+   grep -n "get_draw_count\|duel_rule >= 3\|turn_id == 1" field.cpp
+   grep -n "duel_rule <= 2\|turn_id > 1" processor.cpp
+   grep -n "DUEL_REVEAL_DECK_SEQ" common.h
+   ```
+2. **确认逻辑没变**：看这几处的逻辑是否还是"先攻第一回合不抽卡"的形式。如果上游改了这个逻辑（比如把判断挪了位置、改了规则），补丁要相应调整。
+3. **更新 Python 打补丁脚本的匹配串**（如果用了自动化方案）：脚本里 `pattern count != 1` 会报错，提示代码变了，需要更新匹配串。
+
+### 6.3 用自动化方案时的"自动检测"
+
+之前客户端用的 Python 打补丁脚本自带检测：
+
+```python
+if s.count(old) != 1:
+    print('ERROR: pattern count=%d ...')  # 代码变了，匹配串失效
+    sys.exit(1)
+```
+
+**如果编译报这个错，说明上游改了这三处代码**，按 6.2 重新定位、更新匹配串即可。
+
+### 6.4 srvpro2 更新后
+
+1. 重新同步 `mycard/ygopro-core` 源码（或重新 clone）
+2. 重新打补丁 + 重新编译 wasm（Docker，emscripten 3.1.6）
+3. 重新成对替换 cjs+wasm
+4. **注意**：如果 srvpro2 的 `koishipro-core.js` 依赖也更新了（cjs 胶水代码变了），要确认新 cjs 和你的 wasm 仍匹配（emscripten 版本一致性）
+
+### 6.5 srvpro 更新后
+
+1. 重新 clone `mycard/ygopro` + 重新打两个补丁
+2. 重新编译（Dockerfile.lite）
+3. 替换 ygopro 二进制
+
+### 6.6 客户端更新后
+
+- **MDPro3**：重新 fork/同步 `Fluorohydride/ygopro-core` → 重新跑 Actions 编译 → 重新替换 dll
+- **ygopro**：重新同步 `Fluorohydride/ygopro` → 重新跑 Actions → 重新替换 exe
+- **ygopro2**：用新的 MDPro3 dll 重新覆盖即可（因为它直接套用 MDPro3 的 dll）
+
+### 6.7 一个重要的版本一致性提醒
+
+**emscripten 版本**（wasm 相关）：srvpro2 的 wasm 必须用 emscripten 3.1.6 编译，否则 ABI 不匹配崩溃。上游如果升级了 emscripten，你的编译环境也要跟着对齐。
+
+**ocgcore API 版本**（dll 相关）：客户端 ocgcore.dll 的导出函数签名若发生变化（比如某个函数参数类型变了），直接替换会导致崩溃。替换前可对比新旧 dll 的导出表。
+
+---
+
+## 七、附录
+
+### 附录 A：ocgcore 三处补丁（通用 patch）
+
+```diff
+diff --git a/common.h b/common.h
+index f04e836..bfc09be 100644
+--- a/common.h
++++ b/common.h
+@@ -446,6 +446,8 @@ enum LuaParamType : int32_t {
+ #define DUEL_SIMPLE_AI			0x40
+ #define DUEL_RETURN_DECK_TOP	0x80
+ #define DUEL_REVEAL_DECK_SEQ	0x100
++// Custom: first turn draw (FTD). Off by default; opt-in via duel options.
++#define DUEL_FIRST_TURN_DRAW	0x200
+ 
+ //Activity
+ #define ACTIVITY_SUMMON			1
+diff --git a/field.cpp b/field.cpp
+index 90e6cc2..99ef29b 100644
+--- a/field.cpp
++++ b/field.cpp
+@@ -1867,7 +1867,7 @@ int32_t field::get_summon_count_limit(uint8_t playerid) {
+ 	return count;
+ }
+ int32_t field::get_draw_count(uint8_t playerid) {
+-	if ((core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
++	if (!(core.duel_options & DUEL_FIRST_TURN_DRAW) && (core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
+ 		return 0;
+ 	}
+ 	effect_set eset;
+diff --git a/processor.cpp b/processor.cpp
+index d27f4d1..5f4e1fd 100644
+--- a/processor.cpp
++++ b/processor.cpp
+@@ -3814,7 +3814,7 @@ int32_t field::process_turn(uint16_t step, uint8_t turn_player) {
+ 	}
+ 	case 2: {
+ 		// Draw, new ruling
+-		if((core.duel_rule <= 2) || (infos.turn_id > 1)) {
++		if((core.duel_options & DUEL_FIRST_TURN_DRAW) || (core.duel_rule <= 2) || (infos.turn_id > 1)) {
+ 			int32_t count = get_draw_count(infos.turn_player);
+ 			if(count > 0) {
+ 				draw(nullptr, REASON_RULE, turn_player, turn_player, count);
+```
+
+
+### 附录 B：srvpro ocgcore 补丁（完整 patch）
+
+改动内容与附录 A 相同（三处），只是 `index` 行号因仓库版本略有差异。完整 diff 如下（即 `srvpro-ocgcore-ftd-0x200.patch`）：
+
+```diff
+diff --git a/common.h b/common.h
+index b090808..718e93a 100644
+--- a/common.h
++++ b/common.h
+@@ -425,6 +425,8 @@ inline bool check_playerid(int32_t playerid) {
+ #define DUEL_SIMPLE_AI			0x40
+ #define DUEL_RETURN_DECK_TOP	0x80
+ #define DUEL_REVEAL_DECK_SEQ	0x100
++// Custom: first turn draw (FTD). Off by default; opt-in via duel options.
++#define DUEL_FIRST_TURN_DRAW	0x200
+ 
+ //Activity
+ #define ACTIVITY_SUMMON			1
+diff --git a/field.cpp b/field.cpp
+index a7c3755..fbc8686 100644
+--- a/field.cpp
++++ b/field.cpp
+@@ -1841,7 +1841,7 @@ int32_t field::get_summon_count_limit(uint8_t playerid) {
+ 	return count;
+ }
+ int32_t field::get_draw_count(uint8_t playerid) {
+-	if ((core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
++	if (!(core.duel_options & DUEL_FIRST_TURN_DRAW) && (core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {
+ 		return 0;
+ 	}
+ 	effect_set eset;
+diff --git a/processor.cpp b/processor.cpp
+index 20054d6..b3bd7e0 100644
+--- a/processor.cpp
++++ b/processor.cpp
+@@ -3801,7 +3801,7 @@ int32_t field::process_turn(uint16_t step, uint8_t turn_player) {
+ 	}
+ 	case 2: {
+ 		// Draw, new ruling
+-		if((core.duel_rule <= 2) || (infos.turn_id > 1)) {
++		if((core.duel_options & DUEL_FIRST_TURN_DRAW) || (core.duel_rule <= 2) || (infos.turn_id > 1)) {
+ 			int32_t count = get_draw_count(infos.turn_player);
+ 			if(count > 0) {
+ 				draw(nullptr, REASON_RULE, turn_player, turn_player, count);
+```
+
+### 附录 C：srvpro ygopro 主程序补丁（环境变量开关）
+
+完整 patch（给 `gframe/single_duel.cpp` 加环境变量开关 `YGO_FIRST_TURN_DRAW=1`）：
+
+```diff
+diff --git a/gframe/single_duel.cpp b/gframe/single_duel.cpp
+index fdc6c59..4e9a86c 100644
+--- a/gframe/single_duel.cpp
++++ b/gframe/single_duel.cpp
+@@ -1,4 +1,5 @@
+ #include <array>
++#include <cstdlib>
+ #include <utility>
+ #include "config.h"
+ #include "single_duel.h"
+@@ -586,6 +587,10 @@ void SingleDuel::TPResult(DuelPlayer* dp, unsigned char tp) {
+ 	unsigned int opt = (unsigned int)host_info.duel_rule << 16;
+ 	if(host_info.no_shuffle_deck)
+ 		opt |= DUEL_PSEUDO_SHUFFLE;
++	// Custom FTD: first turn draw. Enable per-server via env YGO_FIRST_TURN_DRAW=1.
++	if(const char* ftd = std::getenv("YGO_FIRST_TURN_DRAW"))
++		if(ftd[0] == '1')
++			opt |= DUEL_FIRST_TURN_DRAW;
+ 	last_replay.WriteInt32(host_info.start_lp, false);
+ 	last_replay.WriteInt32(host_info.start_hand, false);
+ 	last_replay.WriteInt32(host_info.draw_count, false);
+```
+
+> 作用：服务端启动时设置 `YGO_FIRST_TURN_DRAW=1` 环境变量，即可开启 FTD（否则保持标准规则）。
+
+### 附录 D：客户端 Python 打补丁脚本（GitHub Actions 用）
+
+用于 MDPro3 / ygopro 客户端的自动化编译（在 ocgcore 被 checkout 后、编译前，用 Python 打三处补丁）。插入到 build.yml 的 `Fetch ocgcore` 之后：
+
+```yaml
+      - name: Apply FTD patch to ocgcore
+        shell: python
+        run: |
+          import sys
+          def rep(path, old, new):
+              with open(path, 'r', encoding='utf-8', newline='') as f:
+                  s = f.read()
+              if s.count(old) != 1:
+                  print('ERROR: pattern count=%d in %s' % (s.count(old), path))
+                  print(repr(old))
+                  sys.exit(1)
+              s = s.replace(old, new, 1)
+              with open(path, 'w', encoding='utf-8', newline='') as f:
+                  f.write(s)
+              print('patched:', path)
+
+          rep('ocgcore/common.h',
+              '#define DUEL_REVEAL_DECK_SEQ\t0x100',
+              '#define DUEL_REVEAL_DECK_SEQ\t0x100\n#define DUEL_FIRST_TURN_DRAW\t0x200')
+
+          rep('ocgcore/field.cpp',
+              '\tif ((core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {',
+              '\tif (!(core.duel_options & DUEL_FIRST_TURN_DRAW) && (core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {')
+
+          rep('ocgcore/processor.cpp',
+              '\t\tif((core.duel_rule <= 2) || (infos.turn_id > 1)) {',
+              '\t\tif((core.duel_options & DUEL_FIRST_TURN_DRAW) || (core.duel_rule <= 2) || (infos.turn_id > 1)) {')
+
+          print('FTD patch applied OK')
+```
+
+> **缩进说明**：YAML 里 `- name:` 顶格 4 空格、`shell:`/`run:` 6 空格、Python 代码 8 空格起；Python 内部 `def` 里 +4 空格。`\t` 和 `\n` 是字面量（反斜杠+字符），由 Python 运行时解释为制表符/换行。若缩进丢失会导致 YAML/Python 报错。
+
+> **注意（路径前缀差异）**：**MDPro3** 用 `common.h`（**不带** `ocgcore/` 前缀，因为 fork 的是 ygopro-core 仓库本身，文件就在根目录）；**ygopro** 用 `ocgcore/common.h`（**带** `ocgcore/` 前缀，因为官方 CI 把 ocgcore checkout 到了 `ocgcore/` 子目录）。上面代码是 ygopro 版本（带前缀），MDPro3 用时去掉 `ocgcore/` 前缀即可。
+
+---
+
+### 附录 E：srvpro2 TS 补丁（完整 patch）
+
+即 `srvpro2-ftd-0x200.patch`，改 `src/utility/calculate-duel-options.ts`：
+
+```diff
+diff --git a/src/utility/calculate-duel-options.ts b/src/utility/calculate-duel-options.ts
+index a704f58..a6f09b9 100644
+--- a/src/utility/calculate-duel-options.ts
++++ b/src/utility/calculate-duel-options.ts
+@@ -7,10 +7,19 @@ import { OcgcoreDuelOptionFlag } from 'koishipro-core.js';
+  * @param isTag Whether this is a tag duel
+  * @returns Duel options number
+  */
++// Custom ocgcore flag (DUEL_FIRST_TURN_DRAW = 0x200).
++// Not part of upstream OcgcoreDuelOptionFlag: it only takes effect on a patched
++// ocgcore wasm that understands bit 0x200. Enable with env FIRST_TURN_DRAW=1.
++const DUEL_FIRST_TURN_DRAW = 0x200;
++
+ export function calculateDuelOptions(hostinfo: HostInfo): number {
+   // duel_rule is stored in high 16 bits
+   let opt = hostinfo.duel_rule << 16;
+ 
++  if (process.env.FIRST_TURN_DRAW === '1') {
++    opt |= DUEL_FIRST_TURN_DRAW;
++  }
++
+   if (hostinfo.no_shuffle_deck) {
+     opt |= OcgcoreDuelOptionFlag.PseudoShuffle;
+   }
+```
+
+### 附录 F：ygopro 客户端完整 build.yml（改好的）
+
+即 `ygopro-build.yml` 的完整内容（官方 build.yml 在 prepare job 的 `Fetch ocgcore` 之后插入了 `Apply FTD patch to ocgcore` step，其余为官方原版）：
+
+```yaml
+name: Automated Test Build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Parse pull request description for dependency overrides
+      id: parse-pr-override
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+      shell: python
+      run: |
+        # You can override dependencies by specifying a pull request number in the pull request description.
+        # This is useful when you want to test changes which require modifications in the submodules or dependencies.
+        # Expected description format:
+        # > name: NNN
+        # (leading >, dependency name, followed by a PR number)
+        # Example:
+        # > ocgcore: 123
+        # Supported dependencies:
+        # ocgcore, irrlicht
+        import re, os
+        body = os.environ.get('PR_BODY', '')
+        # Default: empty means no override
+        ocgcore_ref = ''
+        irrlicht_ref = ''
+        m = re.search(r'(?m)^\s*>\s*ocgcore\s*:\s*(\d+)\s*$', body)
+        if m:
+            ocgcore_ref = f'refs/pull/{m.group(1)}/head'
+        m = re.search(r'(?m)^\s*>\s*irrlicht\s*:\s*(\d+)\s*$', body)
+        if m:
+            irrlicht_ref = f'refs/pull/{m.group(1)}/head'
+        # Output the parsed refs for downstream jobs
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'ocgcore-ref={ocgcore_ref}\n')
+            f.write(f'irrlicht-ref={irrlicht_ref}\n')
+
+    - name: Fetch ocgcore
+      uses: actions/checkout@v6
+      with:
+        repository: Fluorohydride/ygopro-core
+        path: ocgcore
+        ref: ${{ steps.parse-pr-override.outputs.ocgcore-ref }}
+
+    - name: Apply FTD patch to ocgcore
+      shell: python
+      run: |
+        import sys
+        def rep(path, old, new):
+            with open(path, 'r', encoding='utf-8', newline='') as f:
+                s = f.read()
+            if s.count(old) != 1:
+                print('ERROR: pattern count=%d in %s' % (s.count(old), path))
+                print(repr(old))
+                sys.exit(1)
+            s = s.replace(old, new, 1)
+            with open(path, 'w', encoding='utf-8', newline='') as f:
+                f.write(s)
+            print('patched:', path)
+
+        rep('ocgcore/common.h',
+            '#define DUEL_REVEAL_DECK_SEQ\t0x100',
+            '#define DUEL_REVEAL_DECK_SEQ\t0x100\n#define DUEL_FIRST_TURN_DRAW\t0x200')
+
+        rep('ocgcore/field.cpp',
+            '\tif ((core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {',
+            '\tif (!(core.duel_options & DUEL_FIRST_TURN_DRAW) && (core.duel_rule >= 3) && (infos.turn_id == 1) && (infos.turn_player == playerid)) {')
+
+        rep('ocgcore/processor.cpp',
+            '\t\tif((core.duel_rule <= 2) || (infos.turn_id > 1)) {',
+            '\t\tif((core.duel_options & DUEL_FIRST_TURN_DRAW) || (core.duel_rule <= 2) || (infos.turn_id > 1)) {')
+
+        print('FTD patch applied OK')
+
+    - name: Fetch Irrlicht
+      uses: actions/checkout@v6
+      with:
+        repository: mercury233/irrlicht
+        path: irrlicht
+        ref: ${{ steps.parse-pr-override.outputs.irrlicht-ref }}
+
+    - name: Download lua
+      id: lua
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://www.lua.org/ftp/lua-5.4.8.tar.gz
+        sha256: 4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae
+
+    - name: Extract lua
+      run: |
+        tar xf ${{ steps.lua.outputs.filepath }}
+        mv lua-5.4.8 lua
+
+    - name: Fetch miniaudio
+      uses: actions/checkout@v6
+      with:
+        repository: mackron/miniaudio
+        path: miniaudio-source
+        ref: 9634bedb5b5a2ca38c1ee7108a9358a4e233f14d # tag: 0.11.25
+
+    - name: Use miniaudio split & decoders only
+      run: |
+        mkdir -p miniaudio/extras
+        cp miniaudio-source/extras/miniaudio_split/miniaudio.* miniaudio/
+        cp -r miniaudio-source/extras/decoders miniaudio/extras/
+
+    - name: Upload sources
+      uses: actions/upload-artifact@v6
+      with:
+        name: dependencies-sources
+        path: |
+          lua/
+          miniaudio/
+          irrlicht/include/
+          irrlicht/source/
+          !irrlicht/source/Irrlicht/jpeglib/
+          !irrlicht/source/Irrlicht/libpng/
+          !irrlicht/source/Irrlicht/zlib/
+          ocgcore/
+
+  prepare-static-dependencies:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download libevent
+      id: libevent
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz
+        filename: libevent.tar.gz
+        sha256: f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c
+
+    - name: Extract libevent
+      run: |
+        tar xf ${{ steps.libevent.outputs.filepath }}
+        mv libevent-2.1.13-stable event
+
+    - name: Download freetype
+      id: freetype
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://downloads.sourceforge.net/freetype/freetype-2.14.3.tar.gz
+        sha256: e61b31ab26358b946e767ed7eb7f4bb2e507da1cfefeb7a8861ace7fd5c899a1
+
+    - name: Extract freetype
+      run: |
+        tar xf ${{ steps.freetype.outputs.filepath }}
+        mv freetype-2.14.3 freetype
+
+    - name: Download libjpeg-turbo
+      id: libjpeg-turbo
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz
+        sha256: 6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e
+
+    - name: Extract libjpeg-turbo
+      run: |
+        tar xf ${{ steps.libjpeg-turbo.outputs.filepath }}
+        mv libjpeg-turbo-3.2.0 jpeg
+        cp jpeg/src/jversion.h.in jpeg/src/jversion.h
+
+    - name: Download libpng
+      id: libpng
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://downloads.sourceforge.net/libpng/libpng-1.6.58.tar.gz
+        sha256: 8c9b05b675ca7301a458df2c2e46f26e1d41ff36b8863f8c33530bc58c2e6225
+
+    - name: Extract libpng
+      run: |
+        tar xf ${{ steps.libpng.outputs.filepath }}
+        mv libpng-1.6.58 png
+        cp png/scripts/pnglibconf.h.prebuilt png/pnglibconf.h
+    
+    - name: Download zlib
+      id: zlib
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz
+        sha256: bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+
+    - name: Extract zlib
+      run: |
+        tar xf ${{ steps.zlib.outputs.filepath }}
+        mv zlib-1.3.2 zlib
+
+    - name: Download sqlite
+      id: sqlite
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://www.sqlite.org/2026/sqlite-amalgamation-3530300.zip
+        sha256: 646421e12aac110282ef8cc68f1a62d4bb15fc7b8f09da0b53e29ee690500431
+
+    - name: Extract sqlite
+      run: |
+        7z x ${{ steps.sqlite.outputs.filepath }}
+        mv sqlite-amalgamation-3530300 sqlite3
+
+    - name: Download lzma (xz)
+      id: lzma
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz
+        sha256: 3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d546b974a0
+
+    - name: Extract lzma
+      run: |
+        tar xf ${{ steps.lzma.outputs.filepath }}
+        mv xz-5.8.3 lzma
+
+    - name: Create miniaudio external directory
+      run: |
+        mkdir -p miniaudio/external
+
+    - name: Download ogg
+      id: ogg
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/xiph/ogg/releases/download/v1.3.6/libogg-1.3.6.tar.gz
+        sha256: 83e6704730683d004d20e21b8f7f55dcb3383cdf84c0daedf30bde175f774638
+
+    - name: Extract ogg
+      run: |
+        tar xf ${{ steps.ogg.outputs.filepath }}
+        mv libogg-1.3.6 miniaudio/external/ogg
+
+    - name: Download opus
+      id: opus
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
+        sha256: 65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1
+
+    - name: Extract opus
+      run: |
+        tar xf ${{ steps.opus.outputs.filepath }}
+        mv opus-1.5.2 miniaudio/external/opus
+
+    - name: Download opusfile
+      id: opusfile
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/xiph/opusfile/releases/download/v0.12/opusfile-0.12.tar.gz
+        sha256: 118d8601c12dd6a44f52423e68ca9083cc9f2bfe72da7a8c1acb22a80ae3550b
+
+    - name: Extract opusfile
+      run: |
+        tar xf ${{ steps.opusfile.outputs.filepath }}
+        mv opusfile-0.12 miniaudio/external/opusfile
+
+    - name: Download vorbis
+      id: vorbis
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/xiph/vorbis/releases/download/v1.3.7/libvorbis-1.3.7.tar.gz
+        sha256: 0e982409a9c3fc82ee06e08205b1355e5c6aa4c36bca58146ef399621b0ce5ab
+
+    - name: Extract vorbis
+      run: |
+        tar xf ${{ steps.vorbis.outputs.filepath }}
+        mv libvorbis-1.3.7 miniaudio/external/vorbis
+
+    - name: Upload static dependencies
+      uses: actions/upload-artifact@v6
+      with:
+        name: dependencies-sources-static-link
+        path: |
+          event/
+          freetype/
+          !freetype/docs/
+          jpeg/
+          !jpeg/java/
+          !jpeg/testimages/
+          png/
+          zlib/
+          sqlite3/
+          lzma/
+          miniaudio/
+          !miniaudio/external/opus/dnn/
+
+  build-windows:
+    needs: [prepare, prepare-static-dependencies]
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - windows-x86-sse2
+#          - windows-no-dxsdk
+          - windows-x64-avx2
+          - windows-x64-no-simd
+          - windows-arm64
+          - windows-2025
+        include:
+          - name: windows-x86-sse2
+            os: windows-2022
+            vs: vs2022
+            platform: Win32
+            simd: sse2
+#          - name: windows-no-dxsdk
+#            os: windows-2022
+#            vs: vs2022
+#            platform: x64
+#            nodxsdk: true
+          - name: windows-x64-avx2
+            os: windows-2022
+            vs: vs2022
+            platform: x64
+            simd: avx2
+          - name: windows-x64-no-simd
+            os: windows-2022
+            vs: vs2022
+            platform: x64
+            simd: none
+          - name: windows-arm64
+            os: windows-2022
+            vs: vs2022
+            platform: ARM64
+          - name: windows-2025
+            os: windows-2025-vs2026
+            vs: vs2026
+            platform: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        submodules: false
+      # Git submodules are ignored in this CI script. The `prepare` job downloads them.
+      # For local development, use `git clone --recursive` when cloning the repository,
+      # and then check out the submodules to the `master` branch.
+      # (The submodule references recorded in this repository may be outdated).
+
+    - name: Download prepare sources
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources
+        path: .
+
+    - name: Download static dependencies sources
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources-static-link
+        path: .
+
+    - name: Download NASM
+      id: nasm
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://www.nasm.us/pub/nasm/releasebuilds/3.02/win64/nasm-3.02-win64.zip
+        filename: nasm.zip
+        sha256: 161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7
+
+    - name: Install NASM
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path nasm | Out-Null
+        Expand-Archive -Path ${{ steps.nasm.outputs.filepath }} -DestinationPath nasm
+        Move-Item .\nasm\nasm-3.02\nasm.exe .\nasm
+        $nasmPath = (Resolve-Path .\nasm).Path
+        $nasmPath | Out-File -FilePath $env:GITHUB_PATH -Append
+
+    - name: Download premake
+      id: premake
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/premake/premake-core/releases/download/v5.0.0/premake-5.0.0-windows.zip
+        filename: premake5.zip
+        sha256: 15e63506eed5dfd526b96c8e957a7feff2be6cfe70f46e353bfe4813b82e2fdc
+
+    - name: Extract premake
+      shell: bash
+      run: |
+        7z x ${{ steps.premake.outputs.filepath }}
+
+    - name: Check DirectX SDK
+      if: matrix.nodxsdk != true
+      id: dxsdk
+      uses: actions/cache@v5
+      with:
+        key: dxsdk
+        path: DXSDK
+
+    - name: Download DirectX SDK
+      if: matrix.nodxsdk != true && steps.dxsdk.outputs.cache-hit != 'true'
+      id: dxsdk-download
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://download.microsoft.com/download/a/e/7/ae743f1f-632b-4809-87a9-aa1bb3458e31/DXSDK_Jun10.exe
+        sha256: 705271dc83bfee54d9b94e028426e288d5f070784b7446d164f48ecfbb2a02cb
+
+    - name: Install DirectX SDK
+      if: matrix.nodxsdk != true && steps.dxsdk.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        7z x ${{ steps.dxsdk-download.outputs.filepath }} -aoa
+
+    - name: Set DirectX SDK environment variable
+      if: matrix.nodxsdk != true
+      shell: pwsh
+      run: |
+        $dxsdkPath = Resolve-Path 'DXSDK'
+        "DXSDK_DIR=$($dxsdkPath.ProviderPath)\" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+    - name: Configure libevent
+      shell: bash
+      run: |
+        cp premake/event/msvc-event-config.h event/include/event2/event-config.h
+        cp event/WIN32-Code/nmake/evconfig-private.h event/include/evconfig-private.h
+
+    - name: Copy premake files
+      shell: bash
+      run: |
+        cp -pr premake/* .
+        cp -pr resource/* .
+
+    - name: Use premake to generate Visual Studio solution
+      shell: pwsh
+      run: |
+        .\premake5.exe ${{ matrix.vs }} ${{ matrix.simd && format('--use-simd={0}', matrix.simd) || '' }}
+
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Build solution
+      shell: pwsh
+      run: |
+        MSBuild.exe build\YGOPro.${{ matrix.vs == 'vs2026' && 'slnx' || 'sln' }} /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: YGOPro-${{ matrix.name }}
+        path: |
+          bin/release/x86/YGOPro.exe
+          bin/release/x64/YGOPro.exe
+          bin/release/arm64/YGOPro.exe
+
+  build-linux:
+    needs: [prepare, prepare-static-dependencies]
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - ubuntu-22
+          - ubuntu-24
+          - ubuntu-26
+          - ubuntu-static-link
+          - ubuntu-arm-static-link
+        include:
+          - name: ubuntu-22
+            os: ubuntu-22.04
+            apt-outdated: true
+          - name: ubuntu-24
+            os: ubuntu-24.04
+          - name: ubuntu-26
+            os: ubuntu-26.04
+          - name: ubuntu-static-link
+            os: ubuntu-22.04
+            static-link: true
+          - name: ubuntu-arm-static-link
+            os: ubuntu-24.04-arm
+            static-link: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        submodules: false
+
+    - name: Download prepare sources
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources
+        path: .
+
+    - name: Download static dependencies sources
+      if: matrix.static-link == true
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources-static-link
+        path: .
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev
+
+    - name: Install dependencies (dynamic link)
+      if: matrix.static-link != true
+      run: |
+        sudo apt-get install -y libevent-dev libfreetype6-dev libsqlite3-dev libopusfile-dev libvorbis-dev libjpeg-dev libpng-dev zlib1g-dev liblzma-dev
+
+    - name: Install NASM
+      if: matrix.static-link == true
+      run: |
+        sudo apt-get install -y nasm
+
+    - name: Download premake
+      id: premake
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/premake/premake-core/releases/download/v5.0.0/premake-5.0.0-linux-glibc-2.35.tar.gz
+        filename: premake5.tar.gz
+        sha256: 8e50e143402de3ce0f0fefe4bb3f4f6a7db46c7d66203dc9f134c0348ebfe6c5
+
+    - name: Extract & test premake
+      id: extract-premake
+      run: |
+        tar xf ${{ steps.premake.outputs.filepath }}
+        chmod +x ./premake5
+        mkdir premake-test
+        cp ./premake5 ./premake-test
+        cd ./premake-test
+        if ./premake5 --version; then
+          echo "premake=ok" >> $GITHUB_OUTPUT
+        else
+          echo "premake=fail" >> $GITHUB_OUTPUT
+        fi
+        cd ..
+
+    - name: Fetch premake source (fallback)
+      if: steps.extract-premake.outputs.premake != 'ok'
+      uses: actions/checkout@v6
+      with:
+        repository: premake/premake-core
+        path: premake-source
+        ref: 4f6dab3129f86832c9ed745c69438fcaa5fee460 # tag: v5.0.0
+
+    - name: Build premake (fallback)
+      if: steps.extract-premake.outputs.premake != 'ok'
+      run: |
+        sudo apt-get install -y uuid-dev
+        cd premake-source
+        chmod +x ./Bootstrap.sh
+        ./Bootstrap.sh
+        cp bin/release/premake5 ../premake5
+        cd ..
+
+    - name: Configure libevent
+      if: matrix.static-link == true
+      run: |
+        cd event
+        chmod +x configure build-aux/*
+        ./configure --disable-openssl --enable-static=yes --enable-shared=no
+        sed -f make-event-config.sed < config.h > ./include/event2/event-config.h
+        cd ..
+
+    - name: Configure ogg
+      if: matrix.static-link == true
+      run: |
+        cd miniaudio/external/ogg
+        chmod +x configure
+        ./configure
+        cd ../../..
+
+    - name: Download lzma (xz)
+      if: matrix.apt-outdated == true
+      id: lzma
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz
+        sha256: 3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d546b974a0
+
+    - name: Extract lzma
+      if: matrix.apt-outdated == true
+      run: |
+        tar xf ${{ steps.lzma.outputs.filepath }}
+        mv xz-5.8.3 lzma
+
+    - name: Copy premake files
+      run: |
+        cp -pr premake/* .
+        cp -pr resource/* .
+
+    - name: Use premake to generate make files (apt packages)
+      if: matrix.static-link != true
+      run: |
+        ./premake5 gmake ${{ matrix.apt-outdated == true && '--build-lzma' || '' }}
+
+    - name: Use premake to generate make files (static link)
+      if: matrix.static-link == true
+      run: |
+        ./premake5 gmake --build-all
+
+    - name: Make
+      run: |
+        cd build
+        make -j 4
+        cd ..
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: YGOPro-${{ matrix.name }}
+        path: |
+          bin/release/YGOPro
+
+  build-macos:
+    needs: [prepare, prepare-static-dependencies]
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - macos-15-intel
+          - macos-26-arm
+          - macos-26-intel-cross-compile-static-link
+          - macos-26-arm-static-link
+        include:
+          - name: macos-15-intel
+            os: macos-15-intel
+          - name: macos-26-arm
+            os: macos-26
+          - name: macos-26-intel-cross-compile-static-link
+            os: macos-26
+            cross-build-intel: true
+            static-link: true
+          - name: macos-26-arm-static-link
+            os: macos-26
+            static-link: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        submodules: false
+
+    - name: Download prepare sources
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources
+        path: .
+
+    - name: Download static dependencies sources
+      if: matrix.static-link == true
+      uses: actions/download-artifact@v7
+      with:
+        name: dependencies-sources-static-link
+        path: .
+
+    - name: Install dependencies
+      if: matrix.static-link != true
+      run: |
+        brew install libevent opus opusfile libvorbis zlib sqlite libx11 freetype libjpeg-turbo libpng xz
+
+    - name: Install NASM
+      if: matrix.static-link == true
+      run: |
+        brew install nasm
+
+    - name: Download premake
+      id: premake
+      uses: mercury233/action-cache-download-file@42a33307a0e00b163efaf26f29149a62d7bbd37d
+      with:
+        url: https://github.com/premake/premake-core/releases/download/v5.0.0/premake-5.0.0-macosx${{ runner.arch == 'X64' && '-x64' || '' }}.tar.gz
+        filename: premake5.tar.gz
+        sha256: ${{ runner.arch == 'X64' && '6005c5da9a76d980bcd13e1c9e0b0b04b53e07a39717137b2ee826429a6bda48' || '8952855a0d824f63ca22721f3f32ee947a4762c01008f9eddefeba133bafda0d' }}
+
+    - name: Extract & test premake
+      id: extract-premake
+      run: |
+        tar xf ${{ steps.premake.outputs.filepath }}
+        chmod +x ./premake5
+        mkdir premake-test
+        cp ./premake5 ./premake-test
+        cd ./premake-test
+        if ./premake5 --version; then
+          echo "premake=ok" >> $GITHUB_OUTPUT
+        else
+          echo "premake=fail" >> $GITHUB_OUTPUT
+        fi
+        cd ..
+
+    - name: Fetch premake source (fallback)
+      if: steps.extract-premake.outputs.premake != 'ok'
+      uses: actions/checkout@v6
+      with:
+        repository: premake/premake-core
+        path: premake-source
+        ref: 4f6dab3129f86832c9ed745c69438fcaa5fee460 # tag: v5.0.0
+
+    - name: Build premake (fallback)
+      if: steps.extract-premake.outputs.premake != 'ok'
+      run: |
+        cd premake-source
+        chmod +x ./Bootstrap.sh
+        ./Bootstrap.sh
+        cp bin/release/premake5 ../premake5
+        cd ..
+
+    - name: Configure libevent
+      if: matrix.static-link == true
+      run: |
+        cd event
+        chmod +x configure build-aux/*
+        ./configure --disable-openssl --enable-static=yes --enable-shared=no
+        sed -f make-event-config.sed < config.h > ./include/event2/event-config.h
+        cd ..
+
+    - name: Copy premake files
+      run: |
+        cp -pr premake/* .
+        cp -pr resource/* .
+
+    - name: Use premake to generate make files (Homebrew packages)
+      if: matrix.static-link != true
+      run: |
+        DYLD_LIBRARY_PATH=$(brew --prefix)/lib ./premake5 gmake \
+          --sqlite-include-dir=$(brew --prefix sqlite)/include \
+          --sqlite-lib-dir=$(brew --prefix sqlite)/lib \
+          --zlib-include-dir=$(brew --prefix zlib)/include \
+          --zlib-lib-dir=$(brew --prefix zlib)/lib
+
+    - name: Use premake to generate make files (static link)
+      if: matrix.static-link == true
+      run: |
+        ./premake5 gmake ${{ matrix.cross-build-intel == true && '--mac-intel' || '' }} ${{ matrix.cross-build-arm == true && '--mac-arm' || '' }} \
+          --build-all
+
+    - name: Make
+      run: |
+        cd build
+        make -j 3
+        cd ..
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: YGOPro-${{ matrix.name }}
+        path: |
+          bin/release/YGOPro
+```
+
+---
+
+## 八、关键文件索引
+
+**补丁文件（4 个，对应四个端的改动）**
+
+| 文件                               | 用途                                                                | 对应章节 |
+| -------------------------------- | ----------------------------------------------------------------- | ---- |
+| `ocgcore-ftd-0x200.patch`        | ocgcore 通用三处补丁（所有端共用）                                             | 附录 A |
+| `srvpro2-ftd-0x200.patch`        | **srvpro2** 的 `calculate-duel-options.ts` 补丁（`FIRST_TURN_DRAW=1`） | 第三节  |
+| `srvpro-ocgcore-ftd-0x200.patch` | **srvpro** 的 ocgcore 三处补丁                                         | 附录 B |
+| `srvpro-ygopro-ftd-0x200.patch`  | **srvpro** 的 ygopro 主程序补丁（`YGO_FIRST_TURN_DRAW=1`）                | 附录 C |
+
+**其他产物**
+
+| 文件                 | 用途                              |
+| ------------------ | ------------------------------- |
+| `ygopro-build.yml` | ygopro 客户端改好的 build.yml（含打补丁步骤） |
+
+**说明文档（8 份）**
+
+| 文件                                        | 用途                            |
+| ----------------------------------------- | ----------------------------- |
+| `FTD先攻抽卡-全端修改与维护手册.md`                    | **本手册（主文档，自足）**               |
+| `FTD落地-选型与操作指南.md`                        | 服务端选型（srvpro2 vs srvpro）与整体方案 |
+| `srvpro2-先攻抽卡(FTD)-源码核验与实施方案.md`          | srvpro2 源码核验细节                |
+| `srvpro-先攻抽卡(FTD)-方案.md`                  | srvpro 方案细节                   |
+| `客户端ocgcore-先攻抽卡FTD补丁-通用方案.md`            | 客户端补丁通用方案                     |
+| `客户端ocgcore-FTD补丁-零基础网页操作教程.md`           | MDPro3 零基础编译教程                |
+| `客户端ocgcore-FTD补丁-GitHubActions免费编译手册.md` | GitHub Actions 免费编译手册         |
+| `ygopro经典客户端-FTD补丁方案.md`                  | ygopro 客户端方案                  |

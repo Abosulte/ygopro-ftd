@@ -1,0 +1,21 @@
+diff --git a/gframe/single_duel.cpp b/gframe/single_duel.cpp
+index fdc6c59..4e9a86c 100644
+--- a/gframe/single_duel.cpp
++++ b/gframe/single_duel.cpp
+@@ -1,4 +1,5 @@
+ #include <array>
++#include <cstdlib>
+ #include <utility>
+ #include "config.h"
+ #include "single_duel.h"
+@@ -586,6 +587,10 @@ void SingleDuel::TPResult(DuelPlayer* dp, unsigned char tp) {
+ 	unsigned int opt = (unsigned int)host_info.duel_rule << 16;
+ 	if(host_info.no_shuffle_deck)
+ 		opt |= DUEL_PSEUDO_SHUFFLE;
++	// Custom FTD: first turn draw. Enable per-server via env YGO_FIRST_TURN_DRAW=1.
++	if(const char* ftd = std::getenv("YGO_FIRST_TURN_DRAW"))
++		if(ftd[0] == '1')
++			opt |= DUEL_FIRST_TURN_DRAW;
+ 	last_replay.WriteInt32(host_info.start_lp, false);
+ 	last_replay.WriteInt32(host_info.start_hand, false);
+ 	last_replay.WriteInt32(host_info.draw_count, false);
