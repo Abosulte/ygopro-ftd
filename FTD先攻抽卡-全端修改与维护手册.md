@@ -111,7 +111,9 @@ srvpro2 的 ocgcore 是 **wasm 文件**（`node_modules/koishipro-core.js/dist/v
 
 ### 3.2 步骤
 
-**第 1 步：编译带 FTD 的 wasm（关键：必须用 emscripten 3.1.6）**
+**第 1 步：编译带 FTD 的 wasm（关键：必须用 Docker 编译，锁定 emscripten 3.1.6）**
+
+> ⚠️ **为什么必须用 Docker，而不是本机直接编译**：srvpro2 内置 wasm 是用 emscripten **3.1.6**（Debian bookworm 仓库版）编译的。如果你本机装的是其他版本的 emscripten，编译出来的 wasm 会 ABI 不匹配，对局初始化时直接崩溃。Docker 的作用就是用 `debian:bookworm-slim` 镜像把 emscripten 版本**锁死为 3.1.6**，从根上避免这个坑。
 
 用 Docker 编译，锁定 emscripten 版本（Debian bookworm 仓库的 3.1.6，这是 srvpro2 内置 wasm 的版本，用其他版本会不兼容崩溃）：
 

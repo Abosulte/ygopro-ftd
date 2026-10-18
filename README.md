@@ -36,11 +36,11 @@ FTD 补丁让游戏王对战各端支持「**先攻第一回合也抽卡**」（
    - **安卓版** → 5.5 节
 3. 补丁文件和 build.yml 都已放在本仓库，可直接 `git apply` 使用
 
-## 关键提醒
+## 关键提醒（接手者必读）
 
 - **服务端和客户端的 ocgcore 必须打同一份补丁**，否则录像重放对不上（客户端报错/数据错乱）
 - **两个服务端的环境变量不同**：srvpro2 用 `FIRST_TURN_DRAW=1`，srvpro 用 `YGO_FIRST_TURN_DRAW=1`（多了 `YGO_` 前缀）
-- **srvpro2 的 wasm 必须用 emscripten 3.1.6 编译**，用其他版本会 ABI 不匹配、对局崩溃
+- **srvpro2 的 wasm 必须用 Docker 编译，锁定 emscripten 3.1.6**（Debian bookworm 仓库版）。这是 srvpro2 内置 wasm 的版本，本机直接编译（emscripten 版本不对）会导致 ABI 不匹配、对局初始化崩溃，**这是最容易踩的坑**。具体 Dockerfile 见主文档第三章 3.2 节
 
 ## 上游更新后的维护
 
